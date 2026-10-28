@@ -1,0 +1,13 @@
+{
+  "module_name": "restock-bot",
+  "visibility": "public",
+  "namespace": "viam-labs",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "draw-opener",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-10-28T16:20:27.192979Z",
+  "module_readme_link": "README.md"
+}
