@@ -2,8 +2,16 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam-labs:restock-bot",
   "visibility": "public",
-  "url": "",
-  "description": "Modular generic service: draw-opener",
+  "url": "https://github.com/viam-labs/restock-bot",
+  "description": "Teach and replay arm motions relative to a fiducial-localized fixture",
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam-labs:restock-bot:fixture-teacher",
+      "markdown_link": "viam-labs_restock-bot_fixture-teacher.md",
+      "short_description": "Teach arm motions relative to a fiducial marker and replay them on any machine with the same fixture"
+    }
+  ],
   "markdown_link": "README.md",
   "entrypoint": "bin/restock-bot",
   "first_run": "",

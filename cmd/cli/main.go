@@ -24,7 +24,7 @@ func realMain() error {
 
 	cfg := restockbot.Config{}
 
-	thing, err := restockbot.NewDrawOpener(ctx, deps, generic.Named("foo"), cfg, logger)
+	thing, err := restockbot.NewFixtureTeacher(ctx, deps, generic.Named("foo"), cfg, logger)
 	if err != nil {
 		return err
 	}
