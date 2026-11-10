@@ -28,7 +28,11 @@ func realMain() error {
 	if err != nil {
 		return err
 	}
-	defer thing.Close(ctx)
+	defer func() {
+		if err := thing.Close(ctx); err != nil {
+			logger.Error(err)
+		}
+	}()
 
 	return nil
 }

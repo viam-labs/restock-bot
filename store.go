@@ -243,7 +243,10 @@ func (st *store) fetchNewest(ctx context.Context, fixture, motionName string, ca
 	cf := &cacheFile{SequenceID: seq.ID}
 	last := ""
 	for {
-		resp, err := dc.TabularDataByFilter(ctx, &app.DataByFilterOptions{Filter: filter, Limit: 100, Last: last})
+		// Deprecated without a named replacement. TabularDataBySQL/ByMQL take a
+		// hand-written query and return no Last cursor, so moving off this call
+		// means rewriting the paging loop.
+		resp, err := dc.TabularDataByFilter(ctx, &app.DataByFilterOptions{Filter: filter, Limit: 100, Last: last}) //nolint:staticcheck // see above
 		if err != nil {
 			return nil, err
 		}
