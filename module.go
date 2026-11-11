@@ -140,21 +140,21 @@ func NewFixtureTeacher(ctx context.Context, deps resource.Dependencies, name res
 	if conf.SampleHz <= 0 {
 		conf.SampleHz = 30
 	}
-	a, err := arm.FromDependencies(deps, conf.Arm)
+	a, err := arm.FromProvider(deps, conf.Arm)
 	if err != nil {
 		return nil, err
 	}
-	mot, err := motion.FromDependencies(deps, conf.Motion)
+	mot, err := motion.FromProvider(deps, conf.Motion)
 	if err != nil {
 		return nil, err
 	}
-	pt, err := posetracker.FromDependencies(deps, conf.PoseTracker)
+	pt, err := posetracker.FromProvider(deps, conf.PoseTracker)
 	if err != nil {
 		return nil, err
 	}
 	var sw toggleswitch.Switch
 	if conf.ViewSwitch != "" {
-		if sw, err = toggleswitch.FromDependencies(deps, conf.ViewSwitch); err != nil {
+		if sw, err = toggleswitch.FromProvider(deps, conf.ViewSwitch); err != nil {
 			return nil, err
 		}
 	}
@@ -301,7 +301,8 @@ func (s *fixtureTeacher) Close(ctx context.Context) error {
 	if sess != nil {
 		sess.cancel()
 		<-sess.done
-		s.endSession(sess)
+		// endSession logs its own failure; Close still has to close the store.
+		_ = s.endSession(sess)
 	}
 	return s.store.close()
 }
