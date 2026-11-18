@@ -1,12 +1,14 @@
 package restockbot
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/app"
+	"go.viam.com/rdk/logging"
 	"go.viam.com/rdk/spatialmath"
 )
 
@@ -82,5 +84,40 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 	if cf.SequenceID != "s1" || out.Mark != "hooked" || !spatialmath.PoseAlmostEqual(out.Pose, in.Pose) {
 		t.Fatalf("got %s %+v", cf.SequenceID, out)
+	}
+}
+
+func TestSampleGripper(t *testing.T) {
+	in := Sample{T: 1, Pose: spatialmath.NewZeroPose(), Mark: "grab", Gripper: gripperGrab}
+	out, err := decodeSample(map[string]any{"docommand_output": encodeSample(in)})
+	if err != nil || out.Gripper != gripperGrab {
+		t.Fatalf("got %+v, %v", out, err)
+	}
+	if _, ok := encodeSample(Sample{Pose: spatialmath.NewZeroPose()})["gripper"]; ok {
+		t.Fatal("sample without gripper encoded one")
+	}
+	for _, bad := range []any{"close", 1.0, ""} {
+		row := encodeSample(in)
+		row["gripper"] = bad
+		if _, err := decodeSample(row); err == nil {
+			t.Fatalf("gripper %v accepted", bad)
+		}
+	}
+}
+
+func TestDropCache(t *testing.T) {
+	st := &store{cacheDir: t.TempDir(), logger: logging.NewTestLogger(t)}
+	path := st.cachePath("drawer", "open")
+	if err := writeCache(path, &cacheFile{SequenceID: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	st.dropCache("drawer", "open", "other")
+	st.dropCache("drawer", "../x", "keep") // invalid name: ignored, no panic
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("cache for a different sequence was removed: %v", err)
+	}
+	st.dropCache("drawer", "open", "keep")
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cache not removed: %v", err)
 	}
 }

@@ -19,6 +19,14 @@ const (
 	// cleanupTimeout bounds turning freedrive off, independent of the caller's context.
 	cleanupTimeout = 10 * time.Second
 	maxSampleHz    = 1000
+	// gripperTimeout bounds one open or grab.
+	gripperTimeout = 30 * time.Second
+)
+
+var (
+	errNoSession   = errors.New("no teaching session active")
+	errNoGripper   = errors.New("no 'gripper' configured")
+	errMarkPending = errors.New("previous mark not yet captured, retry")
 )
 
 type session struct {
@@ -30,16 +38,17 @@ type session struct {
 	cancel      context.CancelFunc
 	done        chan struct{}
 
-	mu         sync.Mutex
-	pending    []Sample // captured, not yet uploaded
-	count      int
-	first      time.Time
-	last       time.Time
-	marks      []Sample
-	hasMark    bool
-	markLabel  string
-	markLinear bool
-	uploadErr  error
+	mu          sync.Mutex
+	pending     []Sample // captured, not yet uploaded
+	count       int
+	first       time.Time
+	last        time.Time
+	marks       []Sample
+	hasMark     bool
+	markLabel   string
+	markLinear  bool
+	markGripper string
+	uploadErr   error
 }
 
 func (s *fixtureTeacher) startTeach(ctx context.Context, motionName string) map[string]any {
@@ -140,7 +149,7 @@ func (s *fixtureTeacher) captureSample(ctx context.Context, sess *session) error
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 	if sess.hasMark {
-		smp.Mark, smp.Linear = sess.markLabel, sess.markLinear
+		smp.Mark, smp.Linear, smp.Gripper = sess.markLabel, sess.markLinear, sess.markGripper
 		sess.hasMark = false
 		sess.marks = append(sess.marks, smp)
 	}
@@ -180,12 +189,80 @@ func (s *fixtureTeacher) mark(label string, linear bool) map[string]any {
 	defer s.mu.Unlock()
 	sess := s.session
 	if sess == nil {
-		return fail(errors.New("no teaching session active"))
+		return fail(errNoSession)
 	}
-	sess.mu.Lock()
-	sess.hasMark, sess.markLabel, sess.markLinear = true, label, linear
-	sess.mu.Unlock()
+	if err := setMark(sess, label, linear, ""); err != nil {
+		return fail(err)
+	}
 	return map[string]any{"ok": true}
+}
+
+// setMark queues a mark for the next sample, refusing to overwrite one not yet captured.
+// The caller holds s.mu so the session can't be ended underneath it.
+func setMark(sess *session, label string, linear bool, grip string) error {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.hasMark {
+		return errMarkPending
+	}
+	sess.hasMark, sess.markLabel, sess.markLinear, sess.markGripper = true, label, linear, grip
+	return nil
+}
+
+// gripperAction actuates the gripper during a demonstration and marks the next sample with it.
+func (s *fixtureTeacher) gripperAction(ctx context.Context, action, label string) map[string]any {
+	if s.gripper == nil {
+		return fail(errNoGripper)
+	}
+	if action != gripperOpen && action != gripperGrab {
+		return fail(fmt.Errorf("gripper action must be %q or %q", gripperOpen, gripperGrab))
+	}
+	s.mu.Lock()
+	sess := s.session
+	pending := false
+	if sess != nil {
+		sess.mu.Lock()
+		pending = sess.hasMark
+		sess.mu.Unlock()
+	}
+	s.mu.Unlock()
+	if sess == nil {
+		return fail(errNoSession)
+	}
+	// Refuse before moving; the check after actuating still catches a mark that lands meanwhile.
+	if pending {
+		return fail(errMarkPending)
+	}
+	// Actuate without s.mu so sampling and other commands carry on.
+	holding, err := s.actuate(ctx, action)
+	if err != nil {
+		return fail(err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session != sess {
+		err = errors.New("teaching session ended")
+	} else {
+		err = setMark(sess, orDefault(label, action), false, action)
+	}
+	if err != nil {
+		return fail(fmt.Errorf("gripper %s ran but was not recorded: %w", action, err))
+	}
+	res := map[string]any{"ok": true}
+	if action == gripperGrab {
+		res["holding"] = holding
+	}
+	return res
+}
+
+// actuate opens or grabs; holding is only meaningful for grab.
+func (s *fixtureTeacher) actuate(ctx context.Context, action string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, gripperTimeout)
+	defer cancel()
+	if action == gripperOpen {
+		return false, s.gripper.Open(ctx, nil)
+	}
+	return s.gripper.Grab(ctx, nil)
 }
 
 // endSession turns freedrive off and frees the service; shared by end_teach and Close.
@@ -212,7 +289,7 @@ func (s *fixtureTeacher) endTeach(ctx context.Context) map[string]any {
 	s.session = nil
 	s.mu.Unlock()
 	if sess == nil {
-		return fail(errors.New("no teaching session active"))
+		return fail(errNoSession)
 	}
 	sess.cancel()
 	<-sess.done
@@ -246,7 +323,11 @@ func (s *fixtureTeacher) finishTeach(ctx context.Context, sess *session, finalEr
 	}
 	marks := make([]any, 0, len(sess.marks))
 	for _, m := range sess.marks {
-		marks = append(marks, map[string]any{"label": m.Mark, "linear": m.Linear, "pose": poseToMap(m.Pose)})
+		entry := map[string]any{"label": m.Mark, "linear": m.Linear, "pose": poseToMap(m.Pose)}
+		if m.Gripper != "" {
+			entry["gripper"] = m.Gripper
+		}
+		marks = append(marks, entry)
 	}
 	s.logger.Infof("taught %s/%s as sequence %s (%d samples)", s.fixture, sess.motion, id, sess.count)
 	return map[string]any{"ok": true, "sequence_id": id, "samples": sess.count, "marks": marks}

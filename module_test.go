@@ -30,6 +30,11 @@ func TestValidate(t *testing.T) {
 	if strings.Join(deps, ",") != strings.Join(want, ",") {
 		t.Fatalf("deps = %v, want %v", deps, want)
 	}
+	cfg.Gripper = "gripper"
+	deps, _, err = cfg.Validate("services.0")
+	if err != nil || deps[len(deps)-1] != "gripper" {
+		t.Fatalf("deps = %v, err = %v", deps, err)
+	}
 	if _, _, err := (Config{Arm: "arm", TCP: "t", PoseTracker: "p"}).Validate("x"); err == nil {
 		t.Fatal("expected missing marker error")
 	}
