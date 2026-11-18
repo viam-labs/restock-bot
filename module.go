@@ -9,6 +9,7 @@ import (
 
 	"github.com/golang/geo/r3"
 	"go.viam.com/rdk/components/arm"
+	"go.viam.com/rdk/components/gripper"
 	"go.viam.com/rdk/components/posetracker"
 	toggleswitch "go.viam.com/rdk/components/switch"
 	"go.viam.com/rdk/logging"
@@ -72,6 +73,7 @@ type Config struct {
 	// Marker may be configured as a number or a string.
 	Marker     any        `json:"marker"`
 	ViewSwitch string     `json:"view_switch,omitempty"`
+	Gripper    string     `json:"gripper,omitempty"`
 	SampleHz   float64    `json:"sample_hz,omitempty"`
 	Obstacles  []Obstacle `json:"obstacles,omitempty"`
 }
@@ -99,6 +101,9 @@ func (cfg Config) Validate(path string) ([]string, []string, error) {
 	if cfg.ViewSwitch != "" {
 		deps = append(deps, cfg.ViewSwitch)
 	}
+	if cfg.Gripper != "" {
+		deps = append(deps, cfg.Gripper)
+	}
 	return deps, nil, nil
 }
 
@@ -115,12 +120,13 @@ type fixtureTeacher struct {
 	motion     motion.Service
 	tracker    posetracker.PoseTracker
 	viewSwitch toggleswitch.Switch // nil when view_switch is unset
+	gripper    gripper.Gripper     // nil when gripper is unset
 	obstacles  []spatialmath.Geometry
 	store      *store
 
 	mu          sync.Mutex
 	closed      bool
-	busy        string // "", "teach" or "run"
+	busy        string // "", "teach", "run" or "delete"
 	markerWorld spatialmath.Pose
 	session     *session
 	cancelRun   context.CancelFunc
@@ -158,6 +164,12 @@ func NewFixtureTeacher(ctx context.Context, deps resource.Dependencies, name res
 			return nil, err
 		}
 	}
+	var g gripper.Gripper
+	if conf.Gripper != "" {
+		if g, err = gripper.FromProvider(deps, conf.Gripper); err != nil {
+			return nil, err
+		}
+	}
 	obstacles := make([]spatialmath.Geometry, 0, len(conf.Obstacles))
 	for _, o := range conf.Obstacles {
 		box, err := spatialmath.NewBox(o.Pose.pose(), r3.Vector{X: o.DimsMM.X, Y: o.DimsMM.Y, Z: o.DimsMM.Z}, o.Label)
@@ -176,6 +188,7 @@ func NewFixtureTeacher(ctx context.Context, deps resource.Dependencies, name res
 		motion:     mot,
 		tracker:    pt,
 		viewSwitch: sw,
+		gripper:    g,
 		obstacles:  obstacles,
 		store:      newStore(name.ShortName(), logger),
 	}, nil
@@ -239,7 +252,7 @@ func (s *fixtureTeacher) release() {
 	s.mu.Unlock()
 }
 
-const availableCmds = "start_teach, mark, end_teach, run, stop"
+const availableCmds = "start_teach, mark, gripper, end_teach, run, list_motions, delete, stop"
 
 // DoCommand dispatches {"cmd": ...}; failures are reported in the result, never returned as errors.
 func (s *fixtureTeacher) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
@@ -252,6 +265,10 @@ func (s *fixtureTeacher) DoCommand(ctx context.Context, cmd map[string]interface
 		label, _ := cmd["label"].(string)
 		linear, _ := cmd["linear"].(bool)
 		return s.mark(label, linear), nil
+	case "gripper":
+		action, _ := cmd["action"].(string)
+		label, _ := cmd["label"].(string)
+		return s.gripperAction(ctx, action, label), nil
 	case "end_teach":
 		return s.endTeach(ctx), nil
 	case "run":
@@ -259,7 +276,35 @@ func (s *fixtureTeacher) DoCommand(ctx context.Context, cmd map[string]interface
 		if _, present := cmd["dry_run"]; present && !ok {
 			return fail(errors.New("dry_run must be a boolean")), nil
 		}
-		return s.run(ctx, motionName, dryRun), nil
+		seqID, err := optString(cmd, "sequence_id")
+		if err != nil {
+			return fail(err), nil
+		}
+		// Strict here so a bad motion can't skip a pinned run's motion check.
+		if motionName, err = optString(cmd, "motion"); err != nil {
+			return fail(err), nil
+		}
+		speed, err := parseSpeed(cmd)
+		if err != nil {
+			return fail(err), nil
+		}
+		out := s.run(ctx, motionName, seqID, dryRun, speed)
+		if speed != nil && !dryRun {
+			for _, k := range speedKeys {
+				if v, ok := cmd[k]; ok {
+					out[k] = v
+				}
+			}
+		}
+		return out, nil
+	case "list_motions":
+		return s.listMotions(ctx), nil
+	case "delete":
+		seqID, err := optString(cmd, "sequence_id")
+		if err != nil {
+			return fail(err), nil
+		}
+		return s.deleteMotion(ctx, seqID), nil
 	case "stop":
 		return s.stop(ctx), nil
 	default:
@@ -293,6 +338,11 @@ func (s *fixtureTeacher) Close(ctx context.Context) error {
 		if err := s.arm.Stop(ctx, nil); err != nil {
 			s.logger.Errorf("stopping arm on close: %v", err)
 		}
+		if s.gripper != nil {
+			if err := s.gripper.Stop(ctx, nil); err != nil {
+				s.logger.Errorf("stopping gripper on close: %v", err)
+			}
+		}
 		select {
 		case <-runDone:
 		case <-ctx.Done():
@@ -305,6 +355,18 @@ func (s *fixtureTeacher) Close(ctx context.Context) error {
 		_ = s.endSession(sess)
 	}
 	return s.store.close()
+}
+
+// optString reads an optional string argument; present but not a non-empty string is an error.
+func optString(cmd map[string]any, key string) (string, error) {
+	v, present := cmd[key]
+	if !present {
+		return "", nil
+	}
+	if str, ok := v.(string); ok && str != "" {
+		return str, nil
+	}
+	return "", fmt.Errorf("%s must be a non-empty string", key)
 }
 
 var errNoMotion = errors.New("command requires a 'motion' name")

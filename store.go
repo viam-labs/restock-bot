@@ -26,15 +26,19 @@ const (
 	doCommandOutputKey = "docommand_output"
 	// Sequence windows are padded so boundary samples are always inside; sessions are seconds apart.
 	sequencePad = time.Second
+
+	gripperOpen = "open"
+	gripperGrab = "grab"
 )
 
 // Sample is one TCP pose in the marker frame.
 type Sample struct {
-	At     time.Time // capture time; not stored in the reading
-	T      float64   // seconds since start_teach
-	Pose   spatialmath.Pose
-	Mark   string
-	Linear bool
+	At      time.Time // capture time; not stored in the reading
+	T       float64   // seconds since start_teach
+	Pose    spatialmath.Pose
+	Mark    string
+	Linear  bool
+	Gripper string // gripperOpen or gripperGrab, on marked samples only
 }
 
 func encodeSample(smp Sample) map[string]any {
@@ -46,6 +50,9 @@ func encodeSample(smp Sample) map[string]any {
 	}
 	if smp.Linear {
 		m["linear"] = true
+	}
+	if smp.Gripper != "" {
+		m["gripper"] = smp.Gripper
 	}
 	return m
 }
@@ -68,11 +75,19 @@ func decodeSample(row map[string]any) (Sample, error) {
 	}
 	mark, _ := row["mark"].(string)
 	linear, _ := row["linear"].(bool)
+	var grip string
+	if v, present := row["gripper"]; present {
+		// Reject bad values so a corrupt row can't silently skip an actuation on replay.
+		if grip, _ = v.(string); grip != gripperOpen && grip != gripperGrab {
+			return Sample{}, fmt.Errorf("sample has unknown gripper action %v", v)
+		}
+	}
 	return Sample{
-		T:      v[0],
-		Pose:   spatialmath.NewPose(r3.Vector{X: v[1], Y: v[2], Z: v[3]}, &spatialmath.OrientationVectorDegrees{OX: v[4], OY: v[5], OZ: v[6], Theta: v[7]}),
-		Mark:   mark,
-		Linear: linear,
+		T:       v[0],
+		Pose:    spatialmath.NewPose(r3.Vector{X: v[1], Y: v[2], Z: v[3]}, &spatialmath.OrientationVectorDegrees{OX: v[4], OY: v[5], OZ: v[6], Theta: v[7]}),
+		Mark:    mark,
+		Linear:  linear,
+		Gripper: grip,
 	}, nil
 }
 
@@ -175,6 +190,85 @@ func checkCacheName(name string) error {
 	return nil
 }
 
+func (st *store) cachePath(fixture, motionName string) string {
+	return filepath.Join(st.cacheDir, fixture, motionName+".json")
+}
+
+// listSequences returns every sequence in the organization.
+func (st *store) listSequences(ctx context.Context) ([]*app.Sequence, error) {
+	dc, err := st.data(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var all []*app.Sequence
+	page, err := dc.ListSequences(ctx, st.orgID, 100)
+	for ; err == nil && len(page.Sequences) > 0; page, err = page.NextPage(ctx) {
+		all = append(all, page.Sequences...)
+	}
+	return all, err
+}
+
+func (st *store) getSequence(ctx context.Context, id string) (*app.Sequence, error) {
+	dc, err := st.data(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return dc.GetSequence(ctx, id)
+}
+
+func (st *store) deleteSequence(ctx context.Context, id string) error {
+	dc, err := st.data(ctx)
+	if err != nil {
+		return err
+	}
+	return dc.DeleteSequence(ctx, id)
+}
+
+// resolvePinned fetches one sequence's samples, bypassing the cache.
+func (st *store) resolvePinned(ctx context.Context, seq *app.Sequence) ([]Sample, error) {
+	cf, err := st.fetchSamples(ctx, seq)
+	if err != nil {
+		return nil, err
+	}
+	return decodeSamples(cf)
+}
+
+// dropCache removes the cached motion if it holds sequence id; best effort.
+func (st *store) dropCache(fixture, motionName, id string) {
+	for _, name := range []string{fixture, motionName} {
+		if checkCacheName(name) != nil {
+			return
+		}
+	}
+	path := st.cachePath(fixture, motionName)
+	cf, err := readCache(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			st.logger.Warnf("reading cache %s: %v", path, err)
+		}
+		return
+	}
+	if cf.SequenceID == id {
+		if err := os.Remove(path); err != nil {
+			st.logger.Warnf("removing cache %s: %v", path, err)
+		}
+	}
+}
+
+// decodeSamples decodes cached rows and sorts them by T.
+func decodeSamples(cf *cacheFile) ([]Sample, error) {
+	samples := make([]Sample, 0, len(cf.Samples))
+	for _, row := range cf.Samples {
+		smp, err := decodeSample(row)
+		if err != nil {
+			return nil, err
+		}
+		samples = append(samples, smp)
+	}
+	sort.SliceStable(samples, func(i, j int) bool { return samples[i].T < samples[j].T })
+	return samples, nil
+}
+
 // resolve returns the newest motion's samples, falling back to the local cache when the cloud is unreachable.
 func (st *store) resolve(ctx context.Context, fixture, motionName string) (string, []Sample, error) {
 	for _, name := range []string{fixture, motionName} {
@@ -182,7 +276,7 @@ func (st *store) resolve(ctx context.Context, fixture, motionName string) (strin
 			return "", nil, err
 		}
 	}
-	path := filepath.Join(st.cacheDir, fixture, motionName+".json")
+	path := st.cachePath(fixture, motionName)
 	cached, cacheErr := readCache(path)
 	cf, err := st.fetchNewest(ctx, fixture, motionName, cached)
 	if err != nil {
@@ -192,15 +286,10 @@ func (st *store) resolve(ctx context.Context, fixture, motionName string) (strin
 		st.logger.Warnf("cloud lookup for %s/%s failed, using cached sequence %s: %v", fixture, motionName, cached.SequenceID, err)
 		cf = cached
 	}
-	samples := make([]Sample, 0, len(cf.Samples))
-	for _, row := range cf.Samples {
-		smp, err := decodeSample(row)
-		if err != nil {
-			return "", nil, err
-		}
-		samples = append(samples, smp)
+	samples, err := decodeSamples(cf)
+	if err != nil {
+		return "", nil, err
 	}
-	sort.SliceStable(samples, func(i, j int) bool { return samples[i].T < samples[j].T })
 	// Only cache rows that decoded, so a bad fetch can't poison later offline runs.
 	if cf != cached {
 		if err := writeCache(path, cf); err != nil {
@@ -211,15 +300,7 @@ func (st *store) resolve(ctx context.Context, fixture, motionName string) (strin
 }
 
 func (st *store) fetchNewest(ctx context.Context, fixture, motionName string, cached *cacheFile) (*cacheFile, error) {
-	dc, err := st.data(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var all []*app.Sequence
-	page, err := dc.ListSequences(ctx, st.orgID, 100)
-	for ; err == nil && len(page.Sequences) > 0; page, err = page.NextPage(ctx) {
-		all = append(all, page.Sequences...)
-	}
+	all, err := st.listSequences(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -229,6 +310,15 @@ func (st *store) fetchNewest(ctx context.Context, fixture, motionName string, ca
 	}
 	if cached != nil && cached.SequenceID == seq.ID {
 		return cached, nil
+	}
+	return st.fetchSamples(ctx, seq)
+}
+
+// fetchSamples downloads one sequence's samples.
+func (st *store) fetchSamples(ctx context.Context, seq *app.Sequence) (*cacheFile, error) {
+	dc, err := st.data(ctx)
+	if err != nil {
+		return nil, err
 	}
 	if len(seq.Resources) == 0 {
 		return nil, fmt.Errorf("sequence %s has no resources", seq.ID)
